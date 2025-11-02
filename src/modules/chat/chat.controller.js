@@ -1,64 +1,105 @@
 import { Chat } from "../../../models/chat.model.js";
 import { Message } from "../../../models/Message.model.js";
 import UserModel from "../../../models/User.model.js";
-
+import cloudinary from "../../services/cloudinary.js";
+import fs from "fs";
 export const initChat = async (req, res) => {
   try {
     const { sendBy, sendTo, content, date, time } = req.body;
+    let fileUrl = null;
+    let fileType = null;
 
+    if (!sendBy || !sendTo) {
+      return res.status(400).json({ success: false, message: "Missing user IDs" });
+    }
 
-    // 🟢 1️⃣ ابحث عن الشات بين الطرفين
+    // ✅ ابحث أو أنشئ الشات
     let chat = await Chat.findOne({
       participants: { $all: [sendBy, sendTo] },
     });
 
-    // 🟢 2️⃣ لو الشات مش موجود، أنشئ شات جديد وحدث المستخدمين
     if (!chat) {
-      chat = await Chat.create({ participants: [sendBy, sendTo], messages: [] });
-
-      await Promise.all([
-        UserModel.findByIdAndUpdate(sendBy, { $addToSet: { chats: chat._id } }),
-        UserModel.findByIdAndUpdate(sendTo, { $addToSet: { chats: chat._id } }),
-      ]);
+      chat = await Chat.create({
+        participants: [sendBy, sendTo],
+        messages: [],
+      });
     }
 
-    // 🟢 3️⃣ إنشاء الرسالة الجديدة
-    const message = await Message.create({
+    // ✅ لو في ملف
+    if (req.file) {
+      const mime = req.file.mimetype;
+
+      if (mime.startsWith("image/")) fileType = "image";
+      else if (mime.startsWith("video/")) fileType = "video";
+      else if (mime === "application/pdf") fileType = "pdf";
+      else {
+        return res.status(400).json({
+          success: false,
+          message: "Unsupported file type",
+        });
+      }
+
+      const uploadResult = await new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          {
+            resource_type: fileType === "video" ? "video" : "auto",
+          },
+          (error, result) => {
+            if (error) {
+              console.error("Cloudinary upload error:", error);
+              reject(error);
+            } else {
+              resolve(result);
+            }
+          }
+        );
+        stream.end(req.file.buffer);
+      });
+
+      fileUrl = uploadResult.secure_url;
+    }
+
+    // ✅ إنشاء الرسالة
+    const newMessage = await Message.create({
       chatId: chat._id,
       sendBy,
       sendTo,
       content,
       date,
       time,
+      fileUrl,
+      fileType,
+      isRead: false,
     });
 
-    // 🟢 4️⃣ تحديث بيانات الشات
-    chat.lastMessage = message._id;
-    chat.messages.push(message._id);
+    // ✅ تحديث الشات
+    chat.messages.push(newMessage._id);
+    chat.lastMessage = newMessage._id;
     await chat.save();
 
-    // 🟢 5️⃣ إرسال الرسالة للطرف الآخر في الوقت الحقيقي
-    const io = req.app.get("io");
-    const receiver = await UserModel.findById(sendTo).select("socketId isOnline");
+    await Promise.all([
+      UserModel.findByIdAndUpdate(sendBy, { $addToSet: { chats: chat._id } }),
+      UserModel.findByIdAndUpdate(sendTo, { $addToSet: { chats: chat._id } }),
+    ]);
+  const sendToSocket = await UserModel.findById(sendTo).select('socketId');
 
-    if (receiver?.isOnline && receiver?.socketId) {
-      io.to(receiver.socketId).emit("receiveMessage", {
-        chatId: chat._id,
-        message: message.toObject(),
+    // ✅ إرسال سوكيت للطرف المستلم
+    const io = req.app.get("io"); // لازم تكون معرف io في server.js
+    console.log('fggf',sendToSocket);
+    
+    if (io) {
+      io.to(sendToSocket.socketId).emit("receiveMessage", {
+        message: newMessage,
       });
-    } else {
     }
 
-    // 🟢 6️⃣ الرد على المرسل
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      chatId: chat._id,
-      message,
+      message: newMessage,
     });
-
   } catch (error) {
-    console.error("❌ Error in initChat:", error);
-    res.status(500).json({ success: false, message: "Server error" });
+    console.error("❌ Send message error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 

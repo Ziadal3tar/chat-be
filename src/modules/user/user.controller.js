@@ -1,7 +1,8 @@
 import { asyncHandler } from '../../services/asyncHandler.js'
 import jwt from 'jsonwebtoken';
 import User from '../../../models/User.model.js'
-
+import cloudinary from '../../services/cloudinary.js';
+import fs from 'fs';
 export const searchUser = asyncHandler(async (req, res) => {
   const { name } = req.body;
   const authHeader = req.headers.authorization;
@@ -128,3 +129,44 @@ export const getOnlineFriends = async (req, res) => {
     res.status(500).json({ success: false, message: "Server error" });
   }
 };
+
+
+
+export const updateProfile = asyncHandler(async (req, res) => {
+  const { userId, userName } = req.body;
+  const file = req.file; // الصورة المرفوعة
+
+  if (!userId) {
+    return res.status(400).json({ message: 'User ID is required' });
+  }
+
+  const user = await User.findById(userId);
+  if (!user) {
+    return res.status(404).json({ message: 'User not found' });
+  }
+
+  // ✅ لو فيه اسم جديد
+  if (userName) {
+    user.userName = userName;
+  }
+
+  // ✅ لو فيه صورة جديدة
+  if (file) {
+    const upload = await cloudinary.uploader.upload(file.path, {
+      folder: 'usersImages',
+      resource_type: 'image',
+    });
+
+    user.profileImage = upload.secure_url;
+
+    // حذف الصورة من السيرفر بعد الرفع
+    fs.unlinkSync(file.path);
+  }
+
+  await user.save();
+
+  res.status(200).json({
+    message: 'Profile updated successfully',
+    user,
+  });
+});
