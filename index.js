@@ -24,7 +24,13 @@ app.use(express.json());
 connection();
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+const io = new Server(server, {
+  cors: {
+    origin: ["http://localhost:4200", "https://your-frontend-url"], // دومينات مسموح بيها
+    methods: ["GET", "POST"]
+  },
+  transports: ["websocket", "polling"] // مهم مع Railway
+});
 app.set("onlineUsers", new Map());
 // 🟢 Socket.IO logic
 
