@@ -26,7 +26,7 @@ connection();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: ["http://localhost:4200", "https://your-frontend-url"], // دومينات مسموح بيها
+    origin: ["http://localhost:4200", "https://ziadal3tar.github.io/chat-fe", "https://ziadal3tar.github.io/"], // دومينات مسموح بيها
     methods: ["GET", "POST"]
   },
   transports: ["websocket", "polling"] // مهم مع Railway
