@@ -1,24 +1,24 @@
 import express from 'express';
-import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
-import mongoose from 'mongoose';
 import http from 'http';
 import { Server } from 'socket.io';
-import jwt from 'jsonwebtoken';
 import * as indexRouter from './src/modules/index.routes.js';
 import connection from './db/connection.js';
 import { globalError } from './src/services/asyncHandler.js';
 import UserModel from './models/User.model.js';
-import { Chat } from './models/chat.model.js';
 import { Message } from './models/Message.model.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(__dirname, './config/.env') });
 
 const app = express();
-app.use(cors({ origin: "*" }));
+import cors from 'cors';
+app.use(cors({
+  origin: '*', // مؤقتًا للتجربة
+  methods: ['GET','POST']
+}));
 app.use(express.json());
 
 connection();
