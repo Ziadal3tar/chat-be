@@ -123,6 +123,7 @@ export const getUserData = asyncHandler(async (req, res) => {
     const user = await User.findById(decoded.id)
       .select('-password')
       .populate('friends', 'userName email profileImage')
+      .populate('blockedUsers', 'userName email profileImage')
       .populate({
         path: 'chats',
         populate: [

@@ -228,6 +228,9 @@ export const unblockUser = asyncHandler(async (req, res) => {
   const { userId, friendId } = req.body;
 const friend = await User.findById(friendId);
   const user = await User.findById(userId);
+  console.log(userId);
+  console.log(friendId);
+  
   if (!user) return res.status(404).json({ message: "User not found" });
 
   // إزالة المستخدم من قائمة البلوك
@@ -236,6 +239,7 @@ const friend = await User.findById(friendId);
   );
 
   await user.save();
+   const io = req.app.get("io");
   if (friend.socketId){
     io.to(friend.socketId).emit("unBlockUser");}
   res.status(200).json({ message: "User unblocked successfully" });
