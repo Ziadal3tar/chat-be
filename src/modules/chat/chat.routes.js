@@ -1,13 +1,80 @@
+import { Router } from "express";
+import * as chatController from "./chat.controller.js";
+import { authMiddleware } from "../../middleware/auth.js";
+import { createRateLimiter, clientKey } from "../../middleware/rateLimit.js";
+import { uploadMessageFile } from "../../middleware/uploads.js";
+import env from "../../config/env.js";
 
-import express from "express";
-import multer from 'multer';
-import * as chatController from './chat.controller.js'
-const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const router = Router();
 
-router.post("/send", upload.single('file'), chatController.initChat);
-router.post("/getChat", chatController.getChat);
-router.post("/getMyChats", chatController.getMyChats);
-router.post("/markMessagesAsRead", chatController.markMessagesAsRead);
-router.get("/markOneMessagesAsRead/:_id", chatController.markOneMessagesAsRead);
+const messageSendLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: env.messageRateLimit,
+  keyGenerator: clientKey,
+  message: "Too many messages. Please slow down and try again later.",
+});
+
+const chatReadLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: env.chatReadRateLimit,
+  keyGenerator: clientKey,
+  message: "Too many chat requests. Please try again shortly.",
+});
+
+router.post(
+  "/send",
+  authMiddleware,
+  messageSendLimiter,
+  uploadMessageFile.single("file"),
+  chatController.initChat
+);
+router.post("/getChat", authMiddleware, chatReadLimiter, chatController.getChat);
+router.post("/getMyChats", authMiddleware, chatReadLimiter, chatController.getMyChats);
+router.post(
+  "/markMessagesAsRead",
+  authMiddleware,
+  chatReadLimiter,
+  chatController.markMessagesAsRead
+);
+router.get(
+  "/markOneMessagesAsRead/:_id",
+  authMiddleware,
+  chatReadLimiter,
+  chatController.markOneMessagesAsRead
+);
+router.patch(
+  "/messages/:id",
+  authMiddleware,
+  messageSendLimiter,
+  chatController.updateMessage
+);
+router.delete(
+  "/messages/:id",
+  authMiddleware,
+  messageSendLimiter,
+  chatController.deleteMessage
+);
+
+
+router.get(
+  "/stars",
+  authMiddleware,
+  chatReadLimiter,
+  chatController.getStarredMessages
+);
+
+router.patch(
+  "/messages/:id/star",
+  authMiddleware,
+  messageSendLimiter,
+  chatController.starMessage
+);
+
+router.delete(
+  "/messages/:id/star",
+  authMiddleware,
+  messageSendLimiter,
+  chatController.unstarMessage
+);
+
 export default router;

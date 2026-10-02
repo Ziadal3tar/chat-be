@@ -1,161 +1,128 @@
+import "./src/config/env.js";
 import express from "express";
-import path from "path";
-import { fileURLToPath } from "url";
-import dotenv from "dotenv";
 import http from "http";
 import { Server } from "socket.io";
 import cors from "cors";
 import mongoose from "mongoose";
 
-// Routers
+import env from "./src/config/env.js";
 import * as indexRouter from "./src/modules/index.routes.js";
-
-// DB
 import connection from "./db/connection.js";
-
-// Error handler
 import { globalError } from "./src/services/asyncHandler.js";
+import { initializeSocket } from "./src/socket/socket.server.js";
+import { securityHeaders } from "./src/middleware/security.js";
+import { createRateLimiter } from "./src/middleware/rateLimit.js";
+import plansRouter from "./src/modules/plans/plans.routes.js";
+import { startPlanScheduler } from "./src/modules/plans/plans.scheduler.js";
+import storiesRouter from "./src/modules/stories/stories.routes.js";
+import { startStoryScheduler } from "./src/modules/stories/stories.scheduler.js";
 
-// Models
-import UserModel from "./models/User.model.js";
-import { Message } from "./models/Message.model.js";
-
-/* =======================
-   ENV & PATH
-======================= */
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-dotenv.config({ path: path.join(__dirname, "./config/.env") });
-
-/* =======================
-   APP INIT
-======================= */
 const app = express();
+const server = http.createServer(app);
 
-/* =======================
-   MONGOOSE SETTINGS
-======================= */
 mongoose.set("bufferCommands", false);
 
-/* =======================
-   MIDDLEWARES
-======================= */
+const defaultCorsOrigins = [
+  "http://localhost:4200",
+  "https://ziadal3tar.github.io/chat-fe",
+  "https://ziadal3tar.github.io",
+];
+
+const allowedOrigins = env.corsOrigins.length ? env.corsOrigins : defaultCorsOrigins;
+
+app.disable("x-powered-by");
+app.use(securityHeaders);
 app.use(
   cors({
-    origin: "*", // للتجربة – ممكن تحدده لاحقًا
-    methods: ["GET", "POST"],
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS origin is not allowed"));
+    },
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true,
   })
 );
+app.use(express.json({ limit: env.jsonBodyLimit }));
+app.use(express.urlencoded({ extended: true, limit: env.urlEncodedBodyLimit }));
 
-app.use(express.json());
-
-/* =======================
-   HEALTH CHECK (PING)
-======================= */
-app.get("/ping", (req, res) => {
-  res.status(200).send("pong");
+app.get("/ping", (_req, res) => {
+  res.status(200).json({
+    success: true,
+    message: "pong",
+    database: mongoose.connection.readyState === 1 ? "connected" : "disconnected",
+    uptime: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
 });
 
-/* =======================
-   HTTP & SOCKET.IO
-======================= */
-const server = http.createServer(app);
+const apiRateLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: env.apiRateLimit,
+  message: "Too many API requests. Please slow down and try again later.",
+});
+app.use("/api", apiRateLimiter);
 
 const io = new Server(server, {
   cors: {
-    origin: [
-      "http://localhost:4200",
-      "https://ziadal3tar.github.io/chat-fe",
-      "https://ziadal3tar.github.io",
-    ],
+    origin: allowedOrigins,
     methods: ["GET", "POST"],
+    credentials: true,
   },
   transports: ["websocket", "polling"],
 });
 
-// خزن io علشان الكنترولرز
 app.set("io", io);
+initializeSocket(io);
 
-// 🟢 Socket Logic
-io.on("connection", (socket) => {
-  console.log("✅ User connected:", socket.id);
-
-  socket.on("userOnline", async (userId) => {
-    try {
-      socket.userId = userId;
-
-      await UserModel.findByIdAndUpdate(userId, {
-        socketId: socket.id,
-        isOnline: true,
-      });
-
-      console.log(`🟢 ${userId} online`);
-    } catch (err) {
-      console.error("❌ userOnline error:", err);
-    }
-  });
-
-  socket.on("markAsRead", async ({ chatId, readerId, friendId }) => {
-    try {
-      await Message.updateMany(
-        { chatId, sendTo: readerId, isRead: false },
-        { $set: { isRead: true } }
-      );
-
-      const friend = await UserModel.findById(friendId).select("socketId");
-
-      if (friend?.socketId) {
-        io.to(friend.socketId).emit("messagesRead", { chatId });
-      }
-    } catch (err) {
-      console.error("❌ markAsRead error:", err);
-    }
-  });
-
-  socket.on("acceptFriendRequest", ({ fromId, toId }) => {
-    io.to(fromId).emit("friendRequestAccepted", { fromId, toId });
-  });
-
-  socket.on("disconnect", async () => {
-    try {
-      if (!socket.userId) return;
-
-      await UserModel.findByIdAndUpdate(socket.userId, {
-        socketId: "",
-        isOnline: false,
-      });
-
-      console.log("🔴 User disconnected:", socket.userId);
-    } catch (err) {
-      console.error("❌ disconnect error:", err);
-    }
-  });
-});
-
-/* =======================
-   ROUTES
-======================= */
 app.use("/api/auth", indexRouter.authRouter);
 app.use("/api/user", indexRouter.userRouter);
 app.use("/api/chat", indexRouter.chatRouter);
 app.use("/api/friends", indexRouter.friendsRouter);
+app.use("/api/notifications", indexRouter.notificationsRouter);
+app.use("/api/plans", plansRouter);
+app.use("/api/stories", storiesRouter);
 
-/* =======================
-   GLOBAL ERROR
-======================= */
+app.use((_req, res) => {
+  res.status(404).json({ success: false, message: "Route not found" });
+});
+
 app.use(globalError);
 
+const shutdown = async (signal) => {
+  console.log(`\n${signal} received. Shutting down...`);
 
-const PORT = process.env.PORT || 3000;
+  server.close(async (serverError) => {
+    if (serverError) {
+      console.error("HTTP shutdown error:", serverError);
+      process.exit(1);
+      return;
+    }
+
+    try {
+      await mongoose.connection.close(false);
+      console.log("MongoDB connection closed");
+      process.exit(0);
+    } catch (error) {
+      console.error("Shutdown error:", error);
+      process.exit(1);
+    }
+  });
+};
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 connection()
   .then(() => {
     console.log("✅ MongoDB connected");
-
-    server.listen(PORT, () => {
-      console.log(`🚀 Server running on port ${PORT}`);
+    startPlanScheduler(io);
+    startStoryScheduler();
+    server.listen(env.port, () => {
+      console.log(`🚀 Server running on port ${env.port}`);
     });
   })
-  .catch((err) => {
-    console.error("❌ MongoDB connection failed:", err.message);
+  .catch((error) => {
+    console.error("❌ MongoDB connection failed:", error.message);
     process.exit(1);
   });

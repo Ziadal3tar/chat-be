@@ -1,246 +1,413 @@
+import { asyncHandler } from "../../services/asyncHandler.js";
+import { AppError } from "../../services/AppError.js";
+import { emitToUsers } from "../../services/socket.events.js";
+import { createNotification } from "../notifications/notifications.service.js";
+import {
+  createRelationshipPayload,
+  getId,
+  getPendingRequest,
+  hasId,
+  isBlockedEitherDirection,
+  removeRelationshipArtifacts,
+  removeRequest,
+  validateObjectId,
+  validatePair,
+  withUserPairTransaction,
+} from "../../services/relationship.service.js";
+import User from "../../../models/User.model.js";
 
-import { asyncHandler } from '../../services/asyncHandler.js'
-import User from '../../../models/User.model.js'
-import jwt from 'jsonwebtoken';
+const emitFriendEvent = (req, event, userIds, payload = {}) => {
+  emitToUsers(req.app.get("io"), userIds, event, payload);
+};
+
+const notify = async (req, options) => {
+  try {
+    return await createNotification({ io: req.app.get("io"), ...options });
+  } catch (error) {
+    console.error("Notification creation error:", error);
+    return null;
+  }
+};
+
+export const getRelationship = asyncHandler(async (req, res) => {
+  validatePair(req.userId, req.params?.userId);
+
+  const [currentUser, targetUser] = await Promise.all([
+    User.findById(req.userId).select(
+      "friends friendRequests friendRequestsSent blockedUsers",
+    ),
+    User.findById(req.params.userId).select(
+      "friends friendRequests friendRequestsSent blockedUsers",
+    ),
+  ]);
+
+  if (!currentUser || !targetUser) throw new AppError("User not found", 404);
+
+  return res.json({
+    success: true,
+    relationship: createRelationshipPayload(currentUser, targetUser),
+  });
+});
 
 export const sendFriendRequest = asyncHandler(async (req, res) => {
-  const { fromId, toId } = req.body;
+  const fromId = req.userId;
+  const toId = req.body?.toId || req.body?.friendId;
+  validatePair(fromId, toId, "Recipient");
 
-  if (fromId === toId) {
-    return res.status(400).json({ message: "Can't add yourself" });
-  }
+  const result = await withUserPairTransaction(
+    fromId,
+    toId,
+    async ({ currentUser, targetUser }) => {
+      if (isBlockedEitherDirection(currentUser, targetUser)) {
+        throw new AppError(
+          "Friend request is not allowed between these users",
+          403,
+        );
+      }
+      if (hasId(currentUser.friends, targetUser._id)) {
+        throw new AppError("Already friends", 409);
+      }
+      if (
+        getPendingRequest(currentUser.friendRequestsSent, "to", targetUser._id)
+      ) {
+        throw new AppError("Friend request already sent", 409);
+      }
+      if (
+        getPendingRequest(currentUser.friendRequests, "from", targetUser._id)
+      ) {
+        throw new AppError("This user already sent you a friend request", 409);
+      }
 
-  const fromUser = await User.findById(fromId);
-  const toUser = await User.findById(toId);
+      currentUser.friendRequestsSent.push({
+        to: targetUser._id,
+        status: "pending",
+      });
+      targetUser.friendRequests.push({
+        from: currentUser._id,
+        status: "pending",
+      });
 
-  if (!fromUser || !toUser)
-    return res.status(404).json({ message: "User not found" });
+      await Promise.all([currentUser.save(), targetUser.save()]);
 
-  // تحقق هل الطلب موجود أصلاً
-  const alreadySent = fromUser.friendRequestsSent.some(
-    (r) => r.to.toString() === toId && r.status === "pending"
+      return { currentUser, targetUser };
+    },
   );
-  if (alreadySent)
-    return res.status(400).json({ message: "Request already sent" });
 
-  fromUser.friendRequestsSent.push({ to: toId });
-  toUser.friendRequests.push({ from: fromId });
+  const { currentUser, targetUser } = result;
 
-  await fromUser.save();
-  await toUser.save();
+  emitFriendEvent(req, "friendRequestReceived", [targetUser._id], {
+    fromId: currentUser._id,
+    userName: currentUser.userName,
+    profileImage: currentUser.profileImage,
+  });
 
-  // 🔔 إشعار Realtime للطرف الآخر
-  const io = req.app.get("io");
-  if (toUser.socketId){
-    io.to(toUser.socketId).emit("friendRequestReceived", {
-      fromId,
-      userName: fromUser.userName,
-      profileImage: fromUser.profileImage,
-    });
-  }
-  res.status(200).json({ success: true, message: "Friend request sent" });
+  await notify(req, {
+    recipient: targetUser._id,
+    actor: currentUser._id,
+    type: "friend_request",
+    title: "New friend request",
+    message: `${currentUser.userName} sent you a friend request.`,
+    data: { userId: currentUser._id },
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: "Friend request sent",
+    relationship: createRelationshipPayload(currentUser, targetUser),
+  });
 });
 
-
-/**
- * ✅ قبول طلب صداقة
- */
 export const acceptFriendRequest = asyncHandler(async (req, res) => {
-  const { userId, fromId } = req.body;
+  const userId = req.userId;
+  const fromId = req.body?.fromId;
+  validatePair(userId, fromId, "Sender");
 
-  const user = await User.findById(userId);
-  const sender = await User.findById(fromId);
+  const { currentUser, targetUser } = await withUserPairTransaction(
+    userId,
+    fromId,
+    async ({ currentUser, targetUser }) => {
+      if (isBlockedEitherDirection(currentUser, targetUser)) {
+        throw new AppError(
+          "Friend request cannot be accepted while a block exists",
+          403,
+        );
+      }
 
-  if (!user || !sender)
-    return res.status(404).json({ message: "User not found" });
+      const incoming = getPendingRequest(
+        currentUser.friendRequests,
+        "from",
+        targetUser._id,
+      );
+      const outgoing = getPendingRequest(
+        targetUser.friendRequestsSent,
+        "to",
+        currentUser._id,
+      );
 
-  // عدل حالة الطلب في الطرفين
-  const request = user.friendRequests.find(
-    (r) => r.from.toString() === fromId && r.status === "pending"
+      if (!incoming || !outgoing) {
+        throw new AppError("Pending friend request not found", 404);
+      }
+
+      removeRelationshipArtifacts(currentUser, targetUser);
+      currentUser.friends.addToSet(targetUser._id);
+      targetUser.friends.addToSet(currentUser._id);
+
+      await Promise.all([currentUser.save(), targetUser.save()]);
+      return { currentUser, targetUser };
+    },
   );
-  const sentReq = sender.friendRequestsSent.find(
-    (r) => r.to.toString() === userId && r.status === "pending"
-  );
 
-  if (!request || !sentReq)
-    return res.status(400).json({ message: "Request not found" });
+  emitFriendEvent(req, "friendRequestAccepted", [targetUser._id], {
+    fromId: currentUser._id,
+    toId: targetUser._id,
+  });
+  emitFriendEvent(req, "friendAdded", [currentUser._id, targetUser._id], {
+    userId: currentUser._id,
+    friendId: targetUser._id,
+  });
 
-  request.status = "accepted";
-  sentReq.status = "accepted";
+  await notify(req, {
+    recipient: targetUser._id,
+    actor: currentUser._id,
+    type: "friend_request_accepted",
+    title: "Friend request accepted",
+    message: `${currentUser.userName} accepted your friend request.`,
+    data: { userId: currentUser._id },
+  });
 
-  user.friends.push(fromId);
-  sender.friends.push(userId);
-
-  await user.save();
-  await sender.save();
-
-  const io = req.app.get("io");
-  if (sender.socketId)
-    io.to(sender.socketId).emit("friendRequestAccepted", {
-      fromId: userId,
-      userName: user.userName,
-      profileImage: user.profileImage,
-    });
-
-  res.json({ success: true, message: "Friend request accepted" });
+  return res.json({
+    success: true,
+    message: "Friend request accepted",
+    relationship: createRelationshipPayload(currentUser, targetUser),
+  });
 });
 
-
-/**
- * ❌ رفض طلب صداقة
- */
 export const rejectFriendRequest = asyncHandler(async (req, res) => {
-  const { userId, fromId } = req.body;
+  const userId = req.userId;
+  const fromId = req.body?.fromId;
+  validatePair(userId, fromId, "Sender");
 
-  const user = await User.findById(userId);
-  const sender = await User.findById(fromId);
+  const { currentUser, targetUser } = await withUserPairTransaction(
+    userId,
+    fromId,
+    async ({ currentUser, targetUser }) => {
+      const incoming = getPendingRequest(
+        currentUser.friendRequests,
+        "from",
+        targetUser._id,
+      );
+      const outgoing = getPendingRequest(
+        targetUser.friendRequestsSent,
+        "to",
+        currentUser._id,
+      );
 
-  if (!user || !sender)
-    return res.status(404).json({ message: "User not found" });
+      if (!incoming || !outgoing)
+        throw new AppError("Pending friend request not found", 404);
 
-  const request = user.friendRequests.find(
-    (r) => r.from.toString() === fromId && r.status === "pending"
+      removeRelationshipArtifacts(currentUser, targetUser);
+      await Promise.all([currentUser.save(), targetUser.save()]);
+      return { currentUser, targetUser };
+    },
   );
-  const sentReq = sender.friendRequestsSent.find(
-    (r) => r.to.toString() === userId && r.status === "pending"
-  );
 
-  if (!request || !sentReq)
-    return res.status(400).json({ message: "Request not found" });
+  emitFriendEvent(req, "friendRequestRejected", [targetUser._id], {
+    fromId: currentUser._id,
+    userName: currentUser.userName,
+  });
 
-  request.status = "rejected";
-  sentReq.status = "rejected";
+  await notify(req, {
+    recipient: targetUser._id,
+    actor: currentUser._id,
+    type: "friend_request_rejected",
+    title: "Friend request declined",
+    message: `${currentUser.userName} declined your friend request.`,
+    data: { userId: currentUser._id },
+  });
 
-  await user.save();
-  await sender.save();
-
-  const io = req.app.get("io");
-  if (sender.socketId)
-    io.to(sender.socketId).emit("friendRequestRejected", {
-      fromId: userId,
-      userName: user.userName,
-    });
-
-  res.json({ success: true, message: "Friend request rejected" });
+  return res.json({ success: true, message: "Friend request rejected" });
 });
-
-
 
 export const getFriendRequests = asyncHandler(async (req, res) => {
-  const authHeader = req.headers.authorization;
+  const user = await User.findById(req.userId)
+    .select("friendRequests")
+    .populate(
+      "friendRequests.from",
+      "userName email profileImage isOnline lastSeenAt",
+    )
+    .lean();
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ message: "No token provided" });
-  }
+  if (!user) throw new AppError("User not found", 404);
 
-  const token = authHeader.split(" ")[1];
-  let decoded;
+  const friendRequests = (user.friendRequests || []).filter(
+    (request) => request.status === "pending" && request.from,
+  );
 
-  try {
-    decoded = jwt.verify(token, process.env.JWT_SECRET);
-  } catch (error) {
-    return res.status(401).json({ message: "Invalid or expired token" });
-  }
-
-  try {
-    const user = await User.findById(decoded.id)
-      .populate({
-        path: "friendRequests.from",
-        select: "userName email profileImage",
-      })
-      .lean();
-
-    if (!user) {
-      return res.status(404).json({ message: "User not found" });
-    }
-
-    // 📨 استخراج الطلبات المعلّقة فقط
-    const pendingRequests = user.friendRequests.filter(
-      (req) => req.status === "pending"
-    );
-
-    res.status(200).json({
-      success: true,
-      count: pendingRequests.length,
-      friendRequests: pendingRequests,
-    });
-  } catch (error) {
-    console.error("Error fetching friend requests:", error);
-    res.status(500).json({ message: "Server error" });
-  }
+  return res.json({
+    success: true,
+    count: friendRequests.length,
+    friendRequests,
+  });
 });
+
+export const getFriends = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.userId)
+    .select("friends")
+    .populate(
+      "friends",
+      "userName email profileImage isOnline lastSeenAt createdAt",
+    )
+    .lean();
+
+  if (!user) throw new AppError("User not found", 404);
+  return res.json({
+    success: true,
+    count: user.friends?.length || 0,
+    friends: user.friends || [],
+  });
+});
+
 export const cancelFriendRequest = asyncHandler(async (req, res) => {
-  const { userId, friendId } = req.body;
+  const userId = req.userId;
+  const friendId = req.body?.friendId || req.body?.toId;
+  validatePair(userId, friendId, "Recipient");
 
-  const user = await User.findById(userId);
-  const friend = await User.findById(friendId);
+  const { currentUser, targetUser } = await withUserPairTransaction(
+    userId,
+    friendId,
+    async ({ currentUser, targetUser }) => {
+      if (
+        !getPendingRequest(currentUser.friendRequestsSent, "to", targetUser._id)
+      ) {
+        throw new AppError("Pending friend request not found", 404);
+      }
 
-  if (!user || !friend)
-    return res.status(404).json({ message: "User not found" });
-
-  // إزالة الطلب من المرسل
-
-  user.friendRequestsSent = user.friendRequestsSent.filter(
-    (r) => r.to.toString() !== friendId
+      removeRelationshipArtifacts(currentUser, targetUser);
+      await Promise.all([currentUser.save(), targetUser.save()]);
+      return { currentUser, targetUser };
+    },
   );
 
-  // إزالة الطلب من المستقبل
-  friend.friendRequests = friend.friendRequests.filter(
-    (r) => r.from.toString() !== userId
-  );
+  emitFriendEvent(req, "friendRequestCancelled", [targetUser._id], {
+    fromId: currentUser._id,
+  });
 
-  await user.save();
-  await friend.save();
-const io = req.app.get("io");
-  if (friend.socketId)
-    io.to(friend.socketId).emit("friendRequestRejected", {
-      fromId: userId,
-      userName: user.userName,
-    });
-  res.status(200).json({ message: "Friend request cancelled successfully" });
+  await notify(req, {
+    recipient: targetUser._id,
+    actor: currentUser._id,
+    type: "friend_request_cancelled",
+    title: "Friend request cancelled",
+    message: `${currentUser.userName} cancelled the friend request.`,
+    data: { userId: currentUser._id },
+  });
+
+  return res.json({
+    success: true,
+    message: "Friend request cancelled successfully",
+  });
 });
+
+export const unfriendUser = asyncHandler(async (req, res) => {  
+  const userId = req.userId;
+  const friendId = req.body?.friendId;
+  validatePair(userId, friendId);
+
+  const { currentUser, targetUser } = await withUserPairTransaction(
+    userId,
+    friendId,
+    async ({ currentUser, targetUser }) => {
+      if (!hasId(currentUser.friends, targetUser._id)) {
+        throw new AppError("Users are not friends", 409);
+      }
+
+      currentUser.friends.pull(targetUser._id);
+      targetUser.friends.pull(currentUser._id);
+      removeRelationshipArtifacts(currentUser, targetUser);
+      await Promise.all([currentUser.save(), targetUser.save()]);
+      return { currentUser, targetUser };
+    },
+  );
+
+  emitFriendEvent(req, "friendRemoved", [currentUser._id, targetUser._id], {
+    userId: currentUser._id,
+    friendId: targetUser._id,
+  });
+
+  await notify(req, {
+    recipient: targetUser._id,
+    actor: currentUser._id,
+    type: "friend_removed",
+    title: "Friend removed",
+    message: `${currentUser.userName} removed you from their friends.`,
+    data: { userId: currentUser._id },
+  });
+
+  return res.json({ success: true, message: "Friend removed successfully" });
+});
+
 export const blockUser = asyncHandler(async (req, res) => {
-  const { userId, friendId } = req.body;
+  const userId = req.userId;
+  const targetId = req.body?.friendId;
+  validatePair(userId, targetId, "User");
 
-  const user = await User.findById(userId);
-  if (!user) return res.status(404).json({ message: "User not found" });
+  const { currentUser, targetUser } = await withUserPairTransaction(
+    userId,
+    targetId,
+    async ({ currentUser, targetUser }) => {
+      if (hasId(currentUser.blockedUsers, targetUser._id)) {
+        throw new AppError("User already blocked", 409);
+      }
 
-  // لو مش موجود بالفعل في البلوك
-  if (!user.blockedUsers.includes(friendId)) {
-    user.blockedUsers.push(friendId);
-  }
+      currentUser.blockedUsers.addToSet(targetUser._id);
+      currentUser.friends.pull(targetUser._id);
+      targetUser.friends.pull(currentUser._id);
+      removeRelationshipArtifacts(currentUser, targetUser);
 
-  // حذف الصداقة بين الطرفين إن وجدت
-  user.friends = user.friends.filter((f) => f.toString() !== friendId);
-  const friend = await User.findById(friendId);
-  if (friend) {
-    friend.friends = friend.friends.filter((f) => f.toString() !== userId);
-    await friend.save();
-  }
-
-  await user.save();
- const io = req.app.get("io");
-  if (friend.socketId){
-    io.to(friend.socketId).emit("blockUser");}
-  res.status(200).json({ message: "User blocked successfully" });
-});
-export const unblockUser = asyncHandler(async (req, res) => {
-  const { userId, friendId } = req.body;
-const friend = await User.findById(friendId);
-  const user = await User.findById(userId);
-  console.log(userId);
-  console.log(friendId);
-  
-  if (!user) return res.status(404).json({ message: "User not found" });
-
-  // إزالة المستخدم من قائمة البلوك
-  user.blockedUsers = user.blockedUsers.filter(
-    (blockedId) => blockedId.toString() !== friendId
+      await Promise.all([currentUser.save(), targetUser.save()]);
+      return { currentUser, targetUser };
+    },
   );
 
+  emitFriendEvent(req, "userBlocked", [targetUser._id], {
+    userId: currentUser._id,
+  });
+  emitFriendEvent(req, "friendRemoved", [currentUser._id, targetUser._id], {
+    userId: currentUser._id,
+    friendId: targetUser._id,
+  });
+
+  return res.json({ success: true, message: "User blocked successfully" });
+});
+
+export const unblockUser = asyncHandler(async (req, res) => {
+  const userId = req.userId;
+  const targetId = req.body?.friendId || req.body?.userId;
+  validatePair(userId, targetId, "User");
+
+  const user = await User.findById(userId);
+  if (!user) throw new AppError("User not found", 404);
+
+  if (!hasId(user.blockedUsers, targetId)) {
+    throw new AppError("User is not blocked", 404);
+  }
+
+  user.blockedUsers.pull(targetId);
   await user.save();
-   const io = req.app.get("io");
-  if (friend.socketId){
-    io.to(friend.socketId).emit("unBlockUser");}
-  res.status(200).json({ message: "User unblocked successfully" });
+
+  emitFriendEvent(req, "userUnblocked", [targetId], { userId: user._id });
+  return res.json({ success: true, message: "User unblocked successfully" });
+});
+
+export const getBlockedUsers = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.userId)
+    .select("blockedUsers")
+    .populate("blockedUsers", "userName email profileImage isOnline lastSeenAt")
+    .lean();
+
+  if (!user) throw new AppError("User not found", 404);
+  return res.json({
+    success: true,
+    count: user.blockedUsers?.length || 0,
+    blockedUsers: user.blockedUsers || [],
+  });
 });

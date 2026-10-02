@@ -1,3 +1,9 @@
-
-node_modules
+node_modules/
+config/.env
 .env
+.env.*
+!.env.example
+uploads/
+*.log
+coverage/
+.DS_Store

@@ -1,20 +1,30 @@
 import { Router } from "express";
+import * as userController from "./user.controller.js";
+import { authMiddleware } from "../../middleware/auth.js";
+import { createRateLimiter, clientKey } from "../../middleware/rateLimit.js";
+import { uploadProfileImage } from "../../middleware/uploads.js";
+import env from "../../config/env.js";
 
-import * as userController from './user.controller.js'
-import multer from 'multer';
-const upload = multer({ dest: 'uploads/' });
+const router = Router();
 
-const router = Router()
-router.get("/", (req, res) => {
-    res.status(200).json({ message: 'user' })
-})
+const searchLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: env.searchRateLimit,
+  keyGenerator: clientKey,
+  message: "Too many searches. Please wait before searching again.",
+});
 
+router.get("/", authMiddleware, (_req, res) => res.status(200).json({ message: "user" }));
+// router.get("/all", authMiddleware, searchLimiter, userController.allUsers);
+router.post("/search", authMiddleware, searchLimiter, userController.searchUser);
+router.post("/add-friend", authMiddleware, userController.addFriend);
+router.get("/getUserById/:id", authMiddleware, userController.getUserById);
+router.post(
+  "/update",
+  authMiddleware,
+  uploadProfileImage.single("profileImage"),
+  userController.updateProfile
+);
+router.post("/getOnlineFriends", authMiddleware, userController.getOnlineFriends);
 
-
-router.post('/search', userController.searchUser);
-router.post('/add-friend', userController.addFriend);
-router.get('/getUserById/:id', userController.getUserById);
-router.post('/update', upload.single('profileImage'), userController.updateProfile);
-
-router.post("/getOnlineFriends", userController.getOnlineFriends);
-export default router
+export default router;

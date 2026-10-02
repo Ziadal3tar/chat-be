@@ -1,13 +1,21 @@
 import { Router } from "express";
+import * as authController from "./auth.controller.js";
+import { authMiddleware } from "../../middleware/auth.js";
+import { createRateLimiter, clientKey } from "../../middleware/rateLimit.js";
+import env from "../../config/env.js";
 
-import * as authController from './auth.controller.js'
+const router = Router();
 
-const router = Router()
-router.get("/", (req, res) => {
-    res.status(200).json({ message: 'auth' })
-})
-router.post('/signIn', authController.login);
-router.post('/register', authController.register);
-router.get('/me', authController.getUserData); // ✅ Get user data by token
+const authAttemptLimiter = createRateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: env.authRateLimit,
+  keyGenerator: clientKey,
+  message: "Too many authentication attempts. Please try again later.",
+});
 
-export default router
+router.get("/", (_req, res) => res.status(200).json({ message: "auth" }));
+router.post("/signIn", authAttemptLimiter, authController.login);
+router.post("/register", authAttemptLimiter, authController.register);
+router.get("/me", authMiddleware, authController.getUserData);
+
+export default router;
