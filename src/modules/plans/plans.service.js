@@ -8,9 +8,10 @@ import {
   getOrCreatePrivateChat,
   emitToChatParticipants,
   isValidObjectId,
+  projectMessageForViewer,
 } from "../chat/chat.service.js";
 import { createNotification } from "../notifications/notifications.service.js";
-import { emitToUsers } from "../../services/socket.events.js";
+import { emitToUsers, emitToUser } from "../../services/socket.events.js";
 
 export const PLAN_ACTIONS = new Set([
   "send_reminder",
@@ -210,9 +211,16 @@ export const executePlan = async (plan, io) => {
       file: null,
     });
 
-    await emitToChatParticipants(io, chat, "receiveMessage", {
+    const messageForRecipient = projectMessageForViewer(
+      populatedMessage,
+      target._id
+    );
+
+    // The scheduled sender is already represented by the completed plan.
+    // Realtime delivery is only needed for the recipient.
+    emitToUser(io, target._id, "receiveMessage", {
       chatId: chat._id,
-      message: populatedMessage,
+      message: messageForRecipient,
       source: "scheduled_plan",
       planId: plan._id,
     });
@@ -229,6 +237,30 @@ export const executePlan = async (plan, io) => {
         chatId: chat._id,
         messageId: populatedMessage._id,
       },
+    });
+
+    await createNotification({
+      io,
+      recipient: owner._id,
+      actor: owner._id,
+      type: "scheduled_message_sent",
+      title: "Scheduled message sent",
+      message: `Your scheduled message was sent to ${target.userName}.`,
+      data: {
+        planId: plan._id,
+        chatId: chat._id,
+        messageId: populatedMessage._id,
+        targetUserId: target._id,
+      },
+    });
+
+    emitToUser(io, owner._id, "planCompleted", {
+      planId: plan._id,
+      action: plan.action,
+      targetUserId: target._id,
+      targetUserName: target.userName,
+      chatId: chat._id,
+      messageId: populatedMessage._id,
     });
 
     plan.chatId = chat._id;

@@ -84,7 +84,7 @@ export const login = asyncHandler(async (req, res) => {
 
 export const getUserData = asyncHandler(async (req, res) => {
   const user = await User.findById(req.userId)
-    .select("userName email phone profileImage profileImagePublicId friends blockedUsers createdAt lastSeenAt isOnline bio")
+    .select("userName email phone profileImage profileImagePublicId friends blockedUsers createdAt lastSeenAt isOnline bio chatPreferences")
     .populate("friends", "userName email profileImage isOnline lastSeenAt")
     .populate("blockedUsers", "userName email profileImage isOnline lastSeenAt")
     .lean();

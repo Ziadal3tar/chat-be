@@ -13,7 +13,7 @@ import {
   uploadProfileImage,
 } from "../../services/media.service.js";
 
-const safeUserSelect = "userName email phone profileImage profileImagePublicId bio isOnline createdAt lastSeenAt friends";
+const safeUserSelect = "userName email phone profileImage profileImagePublicId bio isOnline createdAt lastSeenAt friends chatPreferences";
 
 export const searchUser = asyncHandler(async (req, res) => {
   const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
@@ -124,6 +124,43 @@ export const getOnlineFriends = asyncHandler(async (req, res) => {
   return res.status(200).json({
     success: true,
     onlineFriends: onlineFriends.filter((friend) => !blockedIds.has(getId(friend._id))),
+  });
+});
+
+
+
+export const updateChatPreferences = asyncHandler(async (req, res) => {
+  const allowedBackgrounds = new Set([
+    "aurora",
+    "midnight",
+    "paper",
+    "ocean",
+    "rose",
+    "emerald",
+  ]);
+
+  const background = typeof req.body?.chatBackground === "string"
+    ? req.body.chatBackground.trim()
+    : "";
+
+  if (!allowedBackgrounds.has(background)) {
+    throw new AppError("Invalid chat background", 400);
+  }
+
+  const user = await User.findByIdAndUpdate(
+    req.userId,
+    { $set: { "chatPreferences.chatBackground": background } },
+    { new: true, runValidators: true }
+  )
+    .select(safeUserSelect)
+    .lean();
+
+  if (!user) throw new AppError("User not found", 404);
+
+  return res.status(200).json({
+    success: true,
+    message: "Chat preferences updated successfully",
+    user,
   });
 });
 

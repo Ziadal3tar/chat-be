@@ -20,9 +20,19 @@ const toNumber = (value, fallback) => {
 
 const nodeEnv = process.env.NODE_ENV || "development";
 
+const normalizeOrigin = (value) => {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    return new URL(raw).origin;
+  } catch {
+    return raw.replace(/\/+$/, "");
+  }
+};
+
 const rawCorsOrigins = (process.env.CORS_ORIGINS || "")
   .split(",")
-  .map((origin) => origin.trim())
+  .map(normalizeOrigin)
   .filter(Boolean);
 
 const env = Object.freeze({

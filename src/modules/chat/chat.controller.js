@@ -24,6 +24,7 @@ import {
 } from "./chat.service.js";
 import { deleteCloudinaryAsset } from "../../services/media.service.js";
 import env from "../../config/env.js";
+import { emitToUser } from "../../services/socket.events.js";
 
 export const initChat = asyncHandler(async (req, res) => {
   const currentUserId = req.userId;
@@ -72,9 +73,12 @@ export const initChat = asyncHandler(async (req, res) => {
   const messageForViewer = projectMessageForViewer(populatedMessage, currentUserId);
 
   const io = req.app.get("io");
-  await emitToChatParticipants(io, chat, "receiveMessage", {
+  // The sender already receives the authoritative message from this HTTP response.
+  // Emit the realtime copy only to the recipient to avoid response/socket races and duplicates.
+  emitToUser(io, sendTo, "receiveMessage", {
     chatId: chat._id,
     message: messageForViewer,
+    source: "realtime",
   });
 
   await createNotification({
@@ -308,9 +312,43 @@ export const getStarredMessages = asyncHandler(async (req, res) => {
       .lean()
   );
 
-  const items = rows.map((message) =>
-    projectMessageForViewer(message, req.userId)
-  );
+  const chatIds = [...new Set(rows.map((message) => message.chatId?.toString()).filter(Boolean))];
+  const chats = chatIds.length
+    ? await Chat.find({ _id: { $in: chatIds } })
+        .select("_id participants")
+        .populate("participants", "userName profileImage isOnline")
+        .lean()
+    : [];
+
+  const chatMap = new Map(chats.map((chat) => [chat._id.toString(), chat]));
+
+  const items = rows.map((message) => {
+    const sender = message.sendBy && typeof message.sendBy === "object" ? message.sendBy : null;
+    const recipient = message.sendTo && typeof message.sendTo === "object" ? message.sendTo : null;
+    const friend = sender?._id?.toString() === req.userId.toString() ? recipient : sender;
+    const chat = chatMap.get(message.chatId?.toString());
+
+    let text = message.content || "";
+    if (!text) {
+      if (message.fileType === "image") text = "Image";
+      else if (message.fileType === "video") text = "Video";
+      else if (message.fileType === "audio") text = "Voice message";
+      else if (message.fileType === "pdf") text = "PDF document";
+      else text = "Saved message";
+    }
+
+    return {
+      ...projectMessageForViewer(message, req.userId),
+      text,
+      name: friend?.userName || "Friend",
+      image: friend?.profileImage || "",
+      friendId: friend?._id || null,
+      friendName: friend?.userName || "Friend",
+      friendProfileImage: friend?.profileImage || "",
+      chatId: message.chatId,
+      chatExists: !!chat,
+    };
+  });
 
   return res.json({
     success: true,

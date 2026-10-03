@@ -82,6 +82,13 @@ const userSchema = new mongoose.Schema(
       ),
     ],
     blockedUsers: [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    chatPreferences: {
+      chatBackground: {
+        type: String,
+        enum: ["aurora", "midnight", "paper", "ocean", "rose", "emerald"],
+        default: "aurora",
+      },
+    },
   },
   { timestamps: true }
 );
