@@ -19,7 +19,9 @@ router.get("/", authMiddleware, (_req, res) => res.status(200).json({ message: "
 router.post("/search", authMiddleware, searchLimiter, userController.searchUser);
 router.post("/add-friend", authMiddleware, userController.addFriend);
 router.get("/getUserById/:id", authMiddleware, userController.getUserById);
-router.patch("/preferences", authMiddleware, userController.updateChatPreferences);
+router.patch("/preferences", authMiddleware, userController.updatePreferences);
+router.patch("/privacy", authMiddleware, userController.updatePreferences);
+router.patch("/notifications/preferences", authMiddleware, userController.updatePreferences);
 router.post(
   "/update",
   authMiddleware,

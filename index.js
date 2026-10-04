@@ -16,15 +16,27 @@ import plansRouter from "./src/modules/plans/plans.routes.js";
 import { startPlanScheduler } from "./src/modules/plans/plans.scheduler.js";
 import storiesRouter from "./src/modules/stories/stories.routes.js";
 import { startStoryScheduler } from "./src/modules/stories/stories.scheduler.js";
+import { sanitizeMongoInput } from "./src/middleware/sanitize.js";
+import { requestContext } from "./src/middleware/requestContext.js";
 
 const app = express();
+app.use(requestContext);
+
+let compressionMiddleware = null;
+try {
+  const compressionModule = await import("compression");
+  const compression = compressionModule.default || compressionModule;
+  compressionMiddleware = compression();
+} catch {
+  // Compression is optional at runtime; Render/CDN compression remains available.
+}
+
 const server = http.createServer(app);
 
 mongoose.set("bufferCommands", false);
 
 const defaultCorsOrigins = [
   "http://localhost:4200",
-  "https://ziadal3tar.github.io/chat-fe",
   "https://ziadal3tar.github.io",
 ];
 
@@ -32,6 +44,7 @@ const allowedOrigins = env.corsOrigins.length ? env.corsOrigins : defaultCorsOri
 
 app.disable("x-powered-by");
 app.use(securityHeaders);
+if (compressionMiddleware) app.use(compressionMiddleware);
 app.use(
   cors({
     origin(origin, callback) {
@@ -45,6 +58,11 @@ app.use(
 );
 app.use(express.json({ limit: env.jsonBodyLimit }));
 app.use(express.urlencoded({ extended: true, limit: env.urlEncodedBodyLimit }));
+app.use(sanitizeMongoInput);
+
+app.get("/health", (_req, res) => {
+  res.status(200).json({ success: true, status: "ok", database: mongoose.connection.readyState === 1 ? "connected" : "disconnected", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() });
+});
 
 app.get("/ping", (_req, res) => {
   res.status(200).json({

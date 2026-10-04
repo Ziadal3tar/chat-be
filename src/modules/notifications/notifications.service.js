@@ -1,5 +1,6 @@
 import { Notification } from "../../../models/Notification.model.js";
 import { emitToUser } from "../../services/socket.events.js";
+import UserModel from "../../../models/User.model.js";
 
 const actorProjection = "_id userName profileImage isOnline";
 
@@ -13,6 +14,16 @@ export const createNotification = async ({
   data = {},
 }) => {
   if (!recipient || !type || !title || !message) return null;
+
+  const preferenceKey = type.startsWith("friend_request") ? "friendRequests"
+    : type === "message" || type === "message_edited" || type === "message_deleted" ? "messages"
+    : type === "story_view" || type === "story_reaction" ? "stories"
+    : type === "call_incoming" ? "calls"
+    : type === "scheduled_message" || type === "scheduled_message_sent" || type.startsWith("plan_") ? "scheduledMessages"
+    : null;
+  const recipientUser = await UserModel.findById(recipient).select("notificationPreferences chatPreferences").lean();
+  if (type === "message" && recipientUser?.chatPreferences?.notificationsEnabled === false) return null;
+  if (preferenceKey && recipientUser?.notificationPreferences?.[preferenceKey] === false) return null;
 
   const notification = await Notification.create({
     recipient,

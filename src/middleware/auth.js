@@ -1,6 +1,7 @@
 import jwt from "jsonwebtoken";
 import UserModel from "../../models/User.model.js";
 import env from "../config/env.js";
+import { Session } from "../../models/Session.model.js";
 
 export const authMiddleware = async (req, res, next) => {
   
@@ -33,6 +34,19 @@ export const authMiddleware = async (req, res, next) => {
       });
     }
 
+    if ((decoded.tokenVersion || 0) !== (user.tokenVersion || 0)) {
+      return res.status(401).json({ success: false, message: "Session has been revoked" });
+    }
+
+    const session = decoded.sessionId
+      ? await Session.findOne({ user: user._id, tokenId: decoded.sessionId }).lean()
+      : null;
+    if (!session) {
+      return res.status(401).json({ success: false, message: "Session is no longer active" });
+    }
+
+    await Session.updateOne({ _id: session._id }, { $set: { lastSeenAt: new Date() } });
+    req.sessionId = decoded.sessionId;
     req.user = user;
     req.userId = user._id.toString();
 

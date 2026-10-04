@@ -57,6 +57,7 @@ export const globalError = (err, req, res, _next) => {
   return res.status(statusCode).json({
     success: false,
     message: statusCode >= 500 && isProduction ? "Internal server error" : message,
+    requestId: req.requestId,
     ...(!isProduction && err?.details ? { details: err.details } : {}),
   });
 };

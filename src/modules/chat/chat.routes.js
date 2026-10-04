@@ -56,6 +56,13 @@ router.delete(
 );
 
 
+router.get("/search", authMiddleware, chatReadLimiter, chatController.searchMessages);
+router.get("/pinned", authMiddleware, chatReadLimiter, chatController.getPinnedMessages);
+router.patch("/messages/:id/reaction", authMiddleware, messageSendLimiter, chatController.toggleMessageReaction);
+router.patch("/messages/:id/pin", authMiddleware, messageSendLimiter, chatController.toggleMessagePin);
+router.patch("/chats/:id/pin", authMiddleware, messageSendLimiter, chatController.toggleChatPin);
+router.patch("/chats/:id/mute", authMiddleware, messageSendLimiter, chatController.toggleChatMute);
+
 router.get(
   "/stars",
   authMiddleware,

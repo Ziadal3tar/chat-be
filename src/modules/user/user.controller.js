@@ -13,7 +13,7 @@ import {
   uploadProfileImage,
 } from "../../services/media.service.js";
 
-const safeUserSelect = "userName email phone profileImage profileImagePublicId bio isOnline createdAt lastSeenAt friends chatPreferences";
+const safeUserSelect = "userName email phone profileImage profileImagePublicId bio isOnline createdAt lastSeenAt friends chatPreferences privacyPreferences notificationPreferences blockedUsers";
 
 export const searchUser = asyncHandler(async (req, res) => {
   const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
@@ -65,7 +65,7 @@ export const getUserById = asyncHandler(async (req, res) => {
 
   const [user, currentUser] = await Promise.all([
     User.findById(id)
-      .select("userName email profileImage bio isOnline createdAt lastSeenAt friends blockedUsers")
+      .select("userName email profileImage bio isOnline createdAt lastSeenAt friends blockedUsers privacyPreferences")
       .lean(),
     User.findById(req.userId)
       .select("friends friendRequests friendRequestsSent blockedUsers")
@@ -85,6 +85,14 @@ export const getUserById = asyncHandler(async (req, res) => {
     0
   );
 
+  const isSelf = user._id.toString() === req.userId.toString();
+  const canSeeOnline = isSelf
+    || user.privacyPreferences?.onlineStatusVisibility === "everyone"
+    || (user.privacyPreferences?.onlineStatusVisibility === "friends" && relationship.status === "friends");
+  const canSeeLastSeen = isSelf
+    || user.privacyPreferences?.lastSeenVisibility === "everyone"
+    || (user.privacyPreferences?.lastSeenVisibility === "friends" && relationship.status === "friends");
+
   return res.status(200).json({
     success: true,
     user: {
@@ -93,8 +101,8 @@ export const getUserById = asyncHandler(async (req, res) => {
       email: user.email,
       profileImage: user.profileImage,
       bio: user.bio || "",
-      isOnline: user.isOnline,
-      lastSeenAt: user.lastSeenAt,
+      isOnline: canSeeOnline ? !!user.isOnline : false,
+      lastSeenAt: canSeeLastSeen ? user.lastSeenAt : null,
       createdAt: user.createdAt,
       friendsCount: user.friends?.length || 0,
       mutualFriendsCount,
@@ -118,51 +126,62 @@ export const getOnlineFriends = asyncHandler(async (req, res) => {
     blockedUsers: { $ne: req.userId },
     isOnline: true,
   })
-    .select("userName profileImage isOnline lastSeenAt")
+    .select("userName profileImage isOnline lastSeenAt privacyPreferences")
     .lean();
 
   return res.status(200).json({
     success: true,
-    onlineFriends: onlineFriends.filter((friend) => !blockedIds.has(getId(friend._id))),
+    onlineFriends: onlineFriends
+      .filter((friend) => !blockedIds.has(getId(friend._id)))
+      .filter((friend) => friend.privacyPreferences?.onlineStatusVisibility !== "nobody")
+      .map((friend) => ({
+        ...friend,
+        lastSeenAt: friend.privacyPreferences?.lastSeenVisibility === "nobody" ? null : friend.lastSeenAt,
+        privacyPreferences: undefined,
+      })),
   });
 });
 
 
 
-export const updateChatPreferences = asyncHandler(async (req, res) => {
-  const allowedBackgrounds = new Set([
-    "aurora",
-    "midnight",
-    "paper",
-    "ocean",
-    "rose",
-    "emerald",
-  ]);
+export const updatePreferences = asyncHandler(async (req, res) => {
+  const chatBackgrounds = new Set(["aurora", "midnight", "paper", "ocean", "rose", "emerald"]);
+  const body = req.body || {};
+  const updates = {};
 
-  const background = typeof req.body?.chatBackground === "string"
-    ? req.body.chatBackground.trim()
-    : "";
-
-  if (!allowedBackgrounds.has(background)) {
-    throw new AppError("Invalid chat background", 400);
+  if (body.chatBackground !== undefined) {
+    const background = String(body.chatBackground || "").trim();
+    if (!chatBackgrounds.has(background)) throw new AppError("Invalid chat background", 400);
+    updates["chatPreferences.chatBackground"] = background;
+  }
+  for (const key of ["enterToSend", "notificationsEnabled", "mediaAutoDownload"]) {
+    if (body[key] !== undefined) updates[`chatPreferences.${key}`] = !!body[key];
+  }
+  const privacy = body.privacyPreferences || {};
+  if (privacy.lastSeenVisibility) {
+    if (!["everyone", "friends", "nobody"].includes(privacy.lastSeenVisibility)) throw new AppError("Invalid last seen visibility", 400);
+    updates["privacyPreferences.lastSeenVisibility"] = privacy.lastSeenVisibility;
+  }
+  if (privacy.onlineStatusVisibility) {
+    if (!["everyone", "friends", "nobody"].includes(privacy.onlineStatusVisibility)) throw new AppError("Invalid online status visibility", 400);
+    updates["privacyPreferences.onlineStatusVisibility"] = privacy.onlineStatusVisibility;
+  }
+  if (privacy.readReceipts !== undefined) updates["privacyPreferences.readReceipts"] = !!privacy.readReceipts;
+  if (privacy.storyVisibility) {
+    if (!["friends", "everyone"].includes(privacy.storyVisibility)) throw new AppError("Invalid story visibility", 400);
+    updates["privacyPreferences.storyVisibility"] = privacy.storyVisibility;
+  }
+  const notifications = body.notificationPreferences || {};
+  for (const key of ["messages", "friendRequests", "stories", "calls", "scheduledMessages"]) {
+    if (notifications[key] !== undefined) updates[`notificationPreferences.${key}`] = !!notifications[key];
   }
 
-  const user = await User.findByIdAndUpdate(
-    req.userId,
-    { $set: { "chatPreferences.chatBackground": background } },
-    { new: true, runValidators: true }
-  )
-    .select(safeUserSelect)
-    .lean();
-
-  if (!user) throw new AppError("User not found", 404);
-
-  return res.status(200).json({
-    success: true,
-    message: "Chat preferences updated successfully",
-    user,
-  });
+  if (!Object.keys(updates).length) throw new AppError("No preferences were provided", 400);
+  const user = await User.findByIdAndUpdate(req.userId, { $set: updates }, { new: true, runValidators: true }).select(safeUserSelect).lean();
+  return res.json({ success: true, message: "Preferences updated successfully", user });
 });
+
+export const updateChatPreferences = updatePreferences;
 
 export const updateProfile = asyncHandler(async (req, res) => {
   const userName = typeof req.body?.userName === "string" ? req.body.userName.trim() : "";

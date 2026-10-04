@@ -107,6 +107,12 @@ export const emitToChatParticipants = async (io, chat, event, payload) => {
 export const populateMessage = (query) =>
   query.populate([
     {
+      path: "replyTo",
+      model: "Message",
+      select: "content fileUrl fileType sendBy createdAt",
+      populate: { path: "sendBy", model: "User", select: "userName profileImage" },
+    },
+    {
       path: "sendBy",
       model: "User",
       select: "userName email profileImage isOnline",
@@ -114,7 +120,7 @@ export const populateMessage = (query) =>
     {
       path: "sendTo",
       model: "User",
-      select: "userName email profileImage isOnline",
+      select: "userName email profileImage isOnline privacyPreferences",
     },
   ]);
 
@@ -133,12 +139,38 @@ export const projectMessageForViewer = (message, viewerId) => {
   raw.isStarred = starredBy.some(
     (id) => id?.toString() === viewerId?.toString()
   );
+  const pinnedBy = Array.isArray(raw.pinnedBy) ? raw.pinnedBy : [];
+  raw.isPinned = pinnedBy.some((id) => id?.toString() === viewerId?.toString());
+  raw.reactionCounts = Array.isArray(raw.reactions)
+    ? raw.reactions.reduce((acc, item) => {
+        if (item?.emoji) acc[item.emoji] = (acc[item.emoji] || 0) + 1;
+        return acc;
+      }, {})
+    : {};
+  raw.myReaction = Array.isArray(raw.reactions)
+    ? raw.reactions.find((item) => item?.user?.toString() === viewerId?.toString())?.emoji || null
+    : null;
+
+  // If the recipient disabled read receipts, never expose the persisted
+  // read state back to the sender. This keeps privacy behavior consistent
+  // after a page refresh.
+  const senderId = raw.sendBy?._id?.toString?.() || raw.sendBy?.toString?.();
+  const recipientReadReceipts = raw.sendTo?.privacyPreferences?.readReceipts;
+  if (senderId === viewerId?.toString() && recipientReadReceipts === false) {
+    raw.isRead = false;
+  }
+
+  if (raw.sendTo && typeof raw.sendTo === "object") {
+    delete raw.sendTo.privacyPreferences;
+  }
 
   delete raw.starredBy;
+  delete raw.pinnedBy;
+  delete raw.reactions;
   return raw;
 };
 
-export const createMessage = async ({ chat, senderId, recipientId, content, file }) => {
+export const createMessage = async ({ chat, senderId, recipientId, content, file, replyTo = null }) => {
   let media = null;
 
   if (file) {
@@ -151,6 +183,7 @@ export const createMessage = async ({ chat, senderId, recipientId, content, file
     sendBy: senderId,
     sendTo: recipientId,
     content,
+    replyTo: replyTo || null,
     date,
     time,
     fileUrl: media?.url || null,

@@ -17,5 +17,10 @@ router.get("/", (_req, res) => res.status(200).json({ message: "auth" }));
 router.post("/signIn", authAttemptLimiter, authController.login);
 router.post("/register", authAttemptLimiter, authController.register);
 router.get("/me", authMiddleware, authController.getUserData);
+router.patch("/password", authMiddleware, authController.changePassword);
+router.patch("/email", authMiddleware, authController.updateEmail);
+router.get("/sessions", authMiddleware, authController.sessions);
+router.delete("/sessions/:id", authMiddleware, authController.revokeSession);
+router.post("/logout-all", authMiddleware, authController.logoutAll);
 
 export default router;

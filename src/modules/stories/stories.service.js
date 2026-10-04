@@ -2,6 +2,7 @@ import UserModel from "../../../models/User.model.js";
 import { Story } from "../../../models/Story.model.js";
 import { AppError } from "../../services/AppError.js";
 import { deleteCloudinaryAsset, uploadStoryMedia } from "../../services/media.service.js";
+import { createNotification } from "../notifications/notifications.service.js";
 
 const STORY_DURATION_MS = 24 * 60 * 60 * 1000;
 
@@ -11,20 +12,17 @@ const getEligibleUserIds = async (userId) => {
   const me = await UserModel.findById(userId).select("friends blockedUsers").lean();
   if (!me) throw new AppError("User not found", 404);
 
-  const candidateIds = [userId, ...(me.friends || [])].map(id);
-  const candidates = await UserModel.find({ _id: { $in: candidateIds } })
-    .select("_id blockedUsers friends")
-    .lean();
+  const blockedIds = new Set((me.blockedUsers || []).map(id));
+  const friendIds = (me.friends || []).filter((friendId) => !blockedIds.has(friendId.toString()));
+  const publicUsers = await UserModel.find({
+    _id: { $nin: [userId, ...(me.blockedUsers || [])] },
+    "privacyPreferences.storyVisibility": "everyone",
+    blockedUsers: { $ne: userId },
+  }).select("_id").lean();
 
-  return candidates
-    .filter((user) => {
-      if (id(user._id) === id(userId)) return true;
-      const blockedByMe = (me.blockedUsers || []).some((blocked) => id(blocked) === id(user._id));
-      const blocksMe = (user.blockedUsers || []).some((blocked) => id(blocked) === id(userId));
-      return !blockedByMe && !blocksMe;
-    })
-    .map((user) => user._id);
+  return [...new Set([userId.toString(), ...friendIds.map(id), ...publicUsers.map((user) => user._id.toString())])];
 };
+
 
 export const createStory = async ({ ownerId, file, caption }) => {
   if (!file) throw new AppError("Story media is required", 400);
@@ -52,6 +50,9 @@ export const listStories = async (userId) => {
     expiresAt: { $gt: now },
   })
     .populate("owner", "userName profileImage bio isOnline")
+    .populate("viewerDetails.user", "userName profileImage isOnline")
+    .populate("viewers", "userName profileImage isOnline")
+    .populate("reactions.user", "userName profileImage isOnline")
     .sort({ createdAt: 1 })
     .lean();
 
@@ -66,11 +67,36 @@ export const listStories = async (userId) => {
         hasUnviewed: false,
       });
     }
-    const viewed = story.viewers?.some((viewer) => id(viewer) === id(userId));
+    const viewed = story.viewers?.some((viewer) => id(viewer?._id || viewer) === id(userId)) ||
+      story.viewerDetails?.some((viewer) => id(viewer?.user?._id || viewer?.user) === id(userId));
+    const reactionCounts = Array.isArray(story.reactions)
+      ? story.reactions.reduce((acc, item) => { if (item?.emoji) acc[item.emoji] = (acc[item.emoji] || 0) + 1; return acc; }, {})
+      : {};
+    const rawViewerDetails = Array.isArray(story.viewerDetails) && story.viewerDetails.length
+      ? story.viewerDetails
+      : (story.viewers || []).map((viewer) => ({ user: viewer, viewedAt: null }));
+    const viewerDetails = ownerId === id(userId)
+      ? rawViewerDetails.map((viewer) => {
+          const reaction = (story.reactions || []).find((item) => id(item?.user?._id || item?.user) === id(viewer?.user?._id || viewer?.user));
+          return {
+            user: viewer.user,
+            viewedAt: viewer.viewedAt,
+            reaction: reaction?.emoji || null,
+          };
+        })
+      : undefined;
+
     groups.get(ownerId).stories.push({
       ...story,
       isViewed: !!viewed,
+      viewerCount: story.viewerDetails?.length || story.viewers?.length || 0,
+      canSeeViewerCount: ownerId === id(userId),
+      canSeeViewerDetails: ownerId === id(userId),
+      viewerDetails,
+      reactionCounts,
+      myReaction: Array.isArray(story.reactions) ? story.reactions.find((item) => id(item?.user?._id || item?.user) === id(userId))?.emoji || null : null,
       viewers: undefined,
+      reactions: undefined,
     });
     if (!viewed) groups.get(ownerId).hasUnviewed = true;
   }
@@ -78,7 +104,7 @@ export const listStories = async (userId) => {
   return [...groups.values()];
 };
 
-export const viewStory = async (userId, storyId) => {
+export const viewStory = async (userId, storyId, io = null) => {
   const eligibleIds = await getEligibleUserIds(userId);
   const story = await Story.findOne({
     _id: storyId,
@@ -87,9 +113,59 @@ export const viewStory = async (userId, storyId) => {
   });
 
   if (!story) throw new AppError("Story not found", 404);
-  story.viewers.addToSet(userId);
+  const isOwner = id(story.owner) === id(userId);
+  const alreadyViewed = story.viewers.some((viewer) => id(viewer?._id || viewer) === id(userId));
+
+  if (!isOwner) {
+    story.viewers.addToSet(userId);
+    const existingViewer = (story.viewerDetails || []).find((viewer) => id(viewer.user) === id(userId));
+    if (existingViewer) existingViewer.viewedAt = new Date();
+    else story.viewerDetails.push({ user: userId, viewedAt: new Date() });
+  }
+
   await story.save();
-  return { success: true };
+  if (!alreadyViewed && !isOwner) {
+    const viewer = await UserModel.findById(userId).select("userName").lean();
+    const owner = await UserModel.findById(story.owner).select("notificationPreferences").lean();
+    if (owner?.notificationPreferences?.stories !== false) {
+      await createNotification({
+        io,
+        recipient: story.owner,
+        actor: userId,
+        type: "story_view",
+        title: "Your story was viewed",
+        message: `${viewer?.userName || "Someone"} viewed your story.`,
+        data: { storyId: story._id, viewerId: userId },
+      });
+    }
+  }
+  return { success: true, viewerCount: story.viewers.length };
+};
+
+export const toggleStoryReaction = async (userId, storyId, emoji, io = null) => {
+  const eligibleIds = await getEligibleUserIds(userId);
+  const story = await Story.findOne({ _id: storyId, owner: { $in: eligibleIds }, expiresAt: { $gt: new Date() } });
+  if (!story) throw new AppError("Story not found", 404);
+  const current = (story.reactions || []).find((reaction) => id(reaction.user) === id(userId));
+  if (current?.emoji === emoji) story.reactions = story.reactions.filter((reaction) => id(reaction.user) !== id(userId));
+  else if (current) current.emoji = emoji;
+  else story.reactions.push({ user: userId, emoji });
+  await story.save();
+
+  if (id(story.owner) !== id(userId)) {
+    const actor = await UserModel.findById(userId).select("userName").lean();
+    await createNotification({
+      io,
+      recipient: story.owner,
+      actor: userId,
+      type: "story_reaction",
+      title: "Story reaction",
+      message: `${actor?.userName || "Someone"} reacted to your story.`,
+      data: { storyId: story._id, emoji },
+    });
+  }
+  const reactionCounts = (story.reactions || []).reduce((acc, item) => { acc[item.emoji] = (acc[item.emoji] || 0) + 1; return acc; }, {});
+  return { success: true, storyId: story._id, reactionCounts, myReaction: (story.reactions || []).find((item) => id(item.user) === id(userId))?.emoji || null };
 };
 
 export const deleteStory = async (userId, storyId) => {

@@ -28,7 +28,7 @@ import { emitToUser } from "../../services/socket.events.js";
 
 export const initChat = asyncHandler(async (req, res) => {
   const currentUserId = req.userId;
-  const { sendTo, content = "" } = req.body;
+  const { sendTo, content = "", replyTo = null } = req.body;
 
   if (!isValidObjectId(sendTo)) {
     throw new AppError("Recipient is required", 400);
@@ -63,12 +63,20 @@ export const initChat = asyncHandler(async (req, res) => {
   }
 
   const chat = await getOrCreatePrivateChat(currentUserId, sendTo);
+  let validatedReplyTo = null;
+  if (replyTo) {
+    if (!isValidObjectId(replyTo)) throw new AppError("Invalid reply message", 400);
+    const replyMessage = await Message.findOne({ _id: replyTo, chatId: chat._id, isDeleted: false }).select("_id").lean();
+    if (!replyMessage) throw new AppError("Reply message not found", 404);
+    validatedReplyTo = replyMessage._id;
+  }
   const populatedMessage = await createMessage({
     chat,
     senderId: currentUserId,
     recipientId: sendTo,
     content: trimmedContent,
     file: req.file,
+    replyTo: validatedReplyTo,
   });
   const messageForViewer = projectMessageForViewer(populatedMessage, currentUserId);
 
@@ -81,15 +89,19 @@ export const initChat = asyncHandler(async (req, res) => {
     source: "realtime",
   });
 
-  await createNotification({
-    io,
-    recipient: sendTo,
+  const recipientPrefs = await UserModel.findById(sendTo).select("notificationPreferences chatPreferences").lean();
+  const recipientMuted = Array.isArray(chat.mutedBy) && chat.mutedBy.some((id) => id.toString() === sendTo.toString());
+  if (!recipientMuted && recipientPrefs?.notificationPreferences?.messages !== false && recipientPrefs?.chatPreferences?.notificationsEnabled !== false) {
+    await createNotification({
+      io,
+      recipient: sendTo,
     actor: currentUserId,
     type: "message",
     title: "New message",
     message: `${req.user.userName} sent you a message.`,
-    data: { chatId: chat._id, messageId: populatedMessage._id },
-  });
+      data: { chatId: chat._id, messageId: populatedMessage._id },
+    });
+  }
 
   return res.status(201).json({ success: true, message: messageForViewer });
 });
@@ -153,7 +165,7 @@ export const getMyChats = asyncHandler(async (req, res) => {
       path: "lastMessage",
       populate: [
         { path: "sendBy", select: "userName profileImage isOnline" },
-        { path: "sendTo", select: "userName profileImage isOnline" },
+        { path: "sendTo", select: "userName profileImage isOnline privacyPreferences" },
       ],
     })
     .sort({ lastMessageAt: -1, updatedAt: -1 })
@@ -180,10 +192,28 @@ export const getMyChats = asyncHandler(async (req, res) => {
 
   return res.status(200).json({
     success: true,
-    chats: chats.map((chat) => ({
-      ...chat,
-      unreadCount: unreadMap.get(chat._id.toString()) || 0,
-    })),
+    chats: chats.map((chat) => {
+      const lastMessage = chat.lastMessage
+        ? { ...chat.lastMessage }
+        : null;
+      const lastMessageSenderId = lastMessage?.sendBy?._id?.toString?.() || lastMessage?.sendBy?.toString?.();
+      if (lastMessage && lastMessageSenderId === req.userId.toString() && lastMessage.sendTo?.privacyPreferences?.readReceipts === false) {
+        lastMessage.isRead = false;
+      }
+      if (lastMessage?.sendTo && typeof lastMessage.sendTo === "object") {
+        delete lastMessage.sendTo.privacyPreferences;
+      }
+
+      return {
+        ...chat,
+        lastMessage,
+        unreadCount: unreadMap.get(chat._id.toString()) || 0,
+        isPinned: (chat.pinnedBy || []).some((id) => id.toString() === req.userId.toString()),
+        isMuted: (chat.mutedBy || []).some((id) => id.toString() === req.userId.toString()),
+        pinnedBy: undefined,
+        mutedBy: undefined,
+      };
+    }),
   });
 });
 
@@ -209,26 +239,35 @@ export const markMessagesAsRead = asyncHandler(async (req, res) => {
   if (!chat) throw new AppError("Chat not found", 404);
   assertChatParticipant(chat, currentUserId);
 
-  const result = await Message.updateMany(
-    {
-      chatId: chat._id,
-      sendTo: currentUserId,
-      isRead: false,
-      isDeleted: false,
-    },
-    { $set: { isRead: true } }
-  );
+  const unreadRows = await Message.find({
+    chatId: chat._id,
+    sendTo: currentUserId,
+    isRead: false,
+    isDeleted: false,
+  }).select("_id").lean();
+
+  const messageIds = unreadRows.map((row) => row._id);
+  const result = messageIds.length
+    ? await Message.updateMany(
+        { _id: { $in: messageIds }, isRead: false },
+        { $set: { isRead: true } }
+      )
+    : { modifiedCount: 0 };
 
   const modifiedCount = result.modifiedCount ?? 0;
   if (modifiedCount) {
-    await emitToChatParticipants(req.app.get("io"), chat, "messagesRead", {
-      chatId: chat._id,
-      readerId: currentUserId,
-      modifiedCount,
-    });
+    const reader = await UserModel.findById(currentUserId).select("privacyPreferences.readReceipts").lean();
+    if (reader?.privacyPreferences?.readReceipts !== false) {
+      await emitToChatParticipants(req.app.get("io"), chat, "messagesRead", {
+        chatId: chat._id,
+        readerId: currentUserId,
+        messageIds,
+        modifiedCount,
+      });
+    }
   }
 
-  return res.json({ success: true, modifiedCount });
+  return res.json({ success: true, modifiedCount, messageIds });
 });
 
 export const markOneMessagesAsRead = asyncHandler(async (req, res) => {
@@ -251,11 +290,15 @@ export const markOneMessagesAsRead = asyncHandler(async (req, res) => {
     await message.save();
 
     const chat = await Chat.findById(message.chatId);
-    await emitToChatParticipants(req.app.get("io"), chat, "messagesRead", {
-      chatId: message.chatId,
-      readerId: req.userId,
-      messageId: message._id,
-    });
+    const reader = await UserModel.findById(req.userId).select("privacyPreferences.readReceipts").lean();
+    if (reader?.privacyPreferences?.readReceipts !== false) {
+      await emitToChatParticipants(req.app.get("io"), chat, "messagesRead", {
+        chatId: message.chatId,
+        readerId: req.userId,
+        messageIds: [message._id],
+        messageId: message._id,
+      });
+    }
   }
 
   return res.json({ success: true });
@@ -325,7 +368,12 @@ export const getStarredMessages = asyncHandler(async (req, res) => {
   const items = rows.map((message) => {
     const sender = message.sendBy && typeof message.sendBy === "object" ? message.sendBy : null;
     const recipient = message.sendTo && typeof message.sendTo === "object" ? message.sendTo : null;
-    const friend = sender?._id?.toString() === req.userId.toString() ? recipient : sender;
+    const participants = Array.isArray(chatMap.get(message.chatId?.toString())?.participants)
+      ? chatMap.get(message.chatId?.toString())?.participants
+      : [];
+    const friend = sender?._id?.toString() === req.userId.toString()
+      ? (recipient || participants.find((participant) => participant?._id?.toString() !== req.userId.toString()))
+      : (sender || participants.find((participant) => participant?._id?.toString() !== req.userId.toString()));
     const chat = chatMap.get(message.chatId?.toString());
 
     let text = message.content || "";
@@ -337,14 +385,20 @@ export const getStarredMessages = asyncHandler(async (req, res) => {
       else text = "Saved message";
     }
 
+    const projected = projectMessageForViewer(message, req.userId);
     return {
-      ...projectMessageForViewer(message, req.userId),
+      ...projected,
       text,
       name: friend?.userName || "Friend",
       image: friend?.profileImage || "",
       friendId: friend?._id || null,
       friendName: friend?.userName || "Friend",
       friendProfileImage: friend?.profileImage || "",
+      senderName: sender?.userName || "You",
+      senderProfileImage: sender?.profileImage || "",
+      recipientName: recipient?.userName || friend?.userName || "Friend",
+      direction: sender?._id?.toString() === req.userId.toString() ? "You sent" : "Received from",
+      replyPreview: projected?.replyTo?.content || projected?.replyTo?.fileType || null,
       chatId: message.chatId,
       chatExists: !!chat,
     };
@@ -429,6 +483,88 @@ export const unstarMessage = asyncHandler(async (req, res) => {
     messageId: message._id,
     isStarred: false,
   });
+});
+
+export const searchMessages = asyncHandler(async (req, res) => {
+  const chatId = req.query?.chatId;
+  const q = typeof req.query?.q === "string" ? req.query.q.trim() : "";
+  const limit = Math.min(Math.max(Number(req.query?.limit) || 20, 1), 50);
+  if (!isValidObjectId(chatId) || !q) throw new AppError("chatId and search query are required", 400);
+  const chat = await Chat.findOne({ _id: chatId, participants: req.userId }).lean();
+  if (!chat) throw new AppError("Chat not found", 404);
+  const regex = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const rows = await populateMessage(Message.find({ chatId, isDeleted: false, content: { $regex: regex, $options: "i" } }).sort({ createdAt: -1, _id: -1 }).limit(limit).lean());
+  return res.json({ success: true, messages: rows.map((row) => projectMessageForViewer(row, req.userId)) });
+});
+
+export const toggleMessageReaction = asyncHandler(async (req, res) => {
+  const id = req.params.id;
+  const emoji = typeof req.body?.emoji === "string" ? req.body.emoji.trim().slice(0, 8) : "";
+  if (!isValidObjectId(id) || !emoji) throw new AppError("A valid message id and emoji are required", 400);
+  const message = await Message.findById(id);
+  if (!message || message.isDeleted) throw new AppError("Message not found", 404);
+  const chat = await Chat.findById(message.chatId);
+  assertChatParticipant(chat, req.userId);
+  const reactions = Array.isArray(message.reactions) ? message.reactions : [];
+  const existing = reactions.find((r) => r.user.toString() === req.userId.toString());
+  if (existing) {
+    if (existing.emoji === emoji) message.reactions = reactions.filter((r) => r.user.toString() !== req.userId.toString());
+    else existing.emoji = emoji;
+  } else {
+    message.reactions.push({ user: req.userId, emoji });
+  }
+  await message.save();
+  const populated = await populateMessage(Message.findById(message._id));
+  const payload = { message: projectMessageForViewer(populated, req.userId), messageId: message._id, chatId: message.chatId };
+  await emitToChatParticipants(req.app.get("io"), chat, "messageReactionChanged", payload);
+  return res.json({ success: true, ...payload });
+});
+
+export const toggleMessagePin = asyncHandler(async (req, res) => {
+  const id = req.params.id;
+  if (!isValidObjectId(id)) throw new AppError("Invalid message id", 400);
+  const message = await Message.findById(id);
+  if (!message || message.isDeleted) throw new AppError("Message not found", 404);
+  const chat = await Chat.findById(message.chatId);
+  assertChatParticipant(chat, req.userId);
+  const pinned = (message.pinnedBy || []).some((value) => value.toString() === req.userId.toString());
+  if (pinned) message.pinnedBy = message.pinnedBy.filter((value) => value.toString() !== req.userId.toString());
+  else message.pinnedBy.push(req.userId);
+  await message.save();
+  const isPinned = !pinned;
+  await emitToChatParticipants(req.app.get("io"), chat, "messagePinChanged", { messageId: message._id, chatId: message.chatId, userId: req.userId, isPinned });
+  return res.json({ success: true, messageId: message._id, isPinned });
+});
+
+export const toggleChatPin = asyncHandler(async (req, res) => {
+  const chatId = req.params.id;
+  const chat = await Chat.findOne({ _id: chatId, participants: req.userId });
+  if (!chat) throw new AppError("Chat not found", 404);
+  const pinned = (chat.pinnedBy || []).some((value) => value.toString() === req.userId.toString());
+  if (pinned) chat.pinnedBy = chat.pinnedBy.filter((value) => value.toString() !== req.userId.toString());
+  else chat.pinnedBy.push(req.userId);
+  await chat.save();
+  return res.json({ success: true, isPinned: !pinned, chatId: chat._id });
+});
+
+export const toggleChatMute = asyncHandler(async (req, res) => {
+  const chatId = req.params.id;
+  const chat = await Chat.findOne({ _id: chatId, participants: req.userId });
+  if (!chat) throw new AppError("Chat not found", 404);
+  const muted = (chat.mutedBy || []).some((value) => value.toString() === req.userId.toString());
+  if (muted) chat.mutedBy = chat.mutedBy.filter((value) => value.toString() !== req.userId.toString());
+  else chat.mutedBy.push(req.userId);
+  await chat.save();
+  return res.json({ success: true, isMuted: !muted, chatId: chat._id });
+});
+
+export const getPinnedMessages = asyncHandler(async (req, res) => {
+  const chatId = req.query?.chatId;
+  if (!isValidObjectId(chatId)) throw new AppError("Valid chatId is required", 400);
+  const chat = await Chat.findOne({ _id: chatId, participants: req.userId }).lean();
+  if (!chat) throw new AppError("Chat not found", 404);
+  const rows = await populateMessage(Message.find({ chatId, pinnedBy: req.userId, isDeleted: false }).sort({ createdAt: -1 }).limit(100).lean());
+  return res.json({ success: true, messages: rows.map((row) => projectMessageForViewer(row, req.userId)) });
 });
 
 export const deleteMessage = asyncHandler(async (req, res) => {

@@ -8,6 +8,7 @@ router.use(authMiddleware);
 router.get("/", storiesController.list);
 router.post("/", uploadStoryFile.single("file"), storiesController.create);
 router.post("/:id/view", storiesController.view);
+router.post("/:id/reaction", storiesController.react);
 router.delete("/:id", storiesController.remove);
 
 export default router;
